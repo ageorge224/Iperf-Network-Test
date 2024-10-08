@@ -1,5 +1,66 @@
 #!/bin/bash
 
+# Enable error trapping
+set -o errexit # Enable strict error checking
+set -o nounset # Exit if an unset variable is used
+set -o noglob  # Disable filename expansion
+set -eE
+
+handle_error() {
+    local func_name="$1"
+    local err="${2:-check}"
+    local retry_command="$3"
+    local retry_count=0
+    local max_retries=3
+    local backtrace_file="/tmp/error_backtrace.txt"
+
+    # Log the error message
+    log_message red "Error in function '${func_name}': ${err}"
+
+    # Write the error to a specific error log file
+    echo "Error in function '${func_name}': ${err}" >>"$LOCAL_UPDATE_ERROR"
+
+    # Generate backtrace
+    echo "Backtrace:" >>"$backtrace_file"
+    local i=0
+    while caller $i >>"$backtrace_file"; do
+        ((i++))
+    done
+
+    # Temporarily disable errexit
+    set +e
+
+    # Implement retry logic
+    while [[ $retry_count -lt $max_retries ]]; do
+        log_message yellow "Retrying after error... Attempt $((retry_count + 1))/$max_retries"
+
+        # Retry the failed operation
+        if eval "$retry_command"; then
+            log_message green "Retried successfully on attempt $((retry_count + 1))"
+            return 0
+        fi
+
+        # Increase the retry count
+        ((retry_count++))
+
+        # Optional: Add a delay between retries (e.g., 5 seconds)
+        sleep 5
+    done
+
+    # Re-enable errexit
+    set -e
+
+    # If all retries fail, log the failure, print the backtrace, and exit the script
+    log_message red "All retries failed. Exiting script."
+    cat "$backtrace_file"
+    exit 1
+}
+
+# Trap errors and signals
+trap 'handle_error "$BASH_COMMAND" "$?"' ERR
+trap 'echo "Script terminated prematurely" >> "$RUN_LOG"; exit 1' SIGINT SIGTERM
+trap 'handle_error "SIGPIPE received" "$?"' SIGPIPE
+
 # Variables
 SUDO_ASKPASS_PATH="$HOME/sudo_askpass.sh"
 main_ip="192.168.1.169"
