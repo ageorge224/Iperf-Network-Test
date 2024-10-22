@@ -292,6 +292,130 @@ for remote_ip in "${remotes[@]}"; do
     run_test_remote_to_main "$remote_ip"
 done
 
+# Add external server configurations
+declare -A external_servers
+external_servers=(
+    ["iperf.online.net"]="5200:5209:true" # format: "start_port:end_port:ipv6_support"
+    ["iperf.par2.as49434.net"]="9200:9240:false"
+    ["iperf3.moji.fr"]="5200:5240:true"
+    ["ping-90ms.online.net"]="5200:5209:true"
+    ["ping.online.net"]="5200:5209:true"
+    ["ping6.online.net"]="5200:5209:true"
+)
+
+# Function to test if a server:port combination is available
+test_server_availability() {
+    local server="$1"
+    local port="$2"
+    local timeout=5
+
+    if ! timeout "$timeout" bash -c "echo >/dev/tcp/$server/$port" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Function to find an available external server and port
+find_available_server() {
+    local ipv6_enabled="${1:-false}"
+    local -n failed_servers_ref="${2:-dummy_array}" # Reference to array of failed servers
+
+    for server in "${!external_servers[@]}"; do
+        # Skip if this server has already failed
+        # Use a regex pattern without quotes for proper matching
+        if [[ " ${failed_servers_ref[*]} " =~ \ ${server}\  ]]; then
+            continue
+        fi
+
+        IFS=':' read -r start_port end_port supports_ipv6 <<<"${external_servers[$server]}"
+
+        # Skip if IPv6 is requested but server doesn't support it
+        if [[ "$ipv6_enabled" == "true" && "$supports_ipv6" != "true" ]]; then
+            continue
+        fi
+
+        # Try each port in range
+        for port in $(seq "$start_port" "$end_port"); do
+            if test_server_availability "$server" "$port"; then
+                echo "$server:$port"
+                return 0
+            fi
+        done
+    done
+
+    return 1
+}
+
+# Function to run a single external test with all available servers
+run_single_external_test() {
+    local direction="${1:-outbound}" # outbound or inbound
+    local use_ipv6="${2:-false}"     # true or false
+    declare -a failed_servers=()
+
+    log_message blue "Attempting external network test..."
+
+    while true; do
+        if server_info=$(find_available_server "$use_ipv6" failed_servers); then
+            IFS=':' read -r server port <<<"$server_info"
+
+            log_message green "Found available server: $server:$port"
+
+            local ipv6_flag=""
+            [[ "$use_ipv6" == "true" ]] && ipv6_flag="-6"
+
+            local reverse_flag=""
+            [[ "$direction" == "inbound" ]] && reverse_flag="-R"
+
+            if [[ "$dry_run" == true ]]; then
+                log_message yellow "Dry-run: Would run iperf3 $ipv6_flag $reverse_flag -c $server -p $port -t 10"
+                return 0
+            else
+                if iperf3 $ipv6_flag $reverse_flag -c "$server" -p "$port" -t 10 2>&1 | tee -a "$log_file"; then
+                    log_message green "External test completed successfully"
+                    return 0
+                else
+                    log_message yellow "Test failed for $server, trying next server..."
+                    failed_servers+=("$server")
+
+                    # Check if we've tried all servers
+                    if [[ ${#failed_servers[@]} -eq ${#external_servers[@]} ]]; then
+                        log_message red "All servers have been tried and failed"
+                        return 1
+                    fi
+                fi
+            fi
+        else
+            log_message red "No more available servers to try"
+            return 1
+        fi
+    done
+}
+
+# Run tests for each remote machine
+for remote_ip in "${remotes[@]}"; do
+    run_test_main_to_remote "$remote_ip"
+    run_test_remote_to_main "$remote_ip"
+done
+
+# Run just one external test - try different configurations until one succeeds
+log_message blue "Starting external network test..."
+
+# Try IPv4 outbound
+if run_single_external_test "outbound" "false"; then
+    log_message green "IPv4 outbound test succeeded"
+# If that fails, try IPv4 inbound
+elif run_single_external_test "inbound" "false"; then
+    log_message green "IPv4 inbound test succeeded"
+# If that fails, try IPv6 outbound
+elif run_single_external_test "outbound" "true"; then
+    log_message green "IPv6 outbound test succeeded"
+# If that fails, try IPv6 inbound
+elif run_single_external_test "inbound" "true"; then
+    log_message green "IPv6 inbound test succeeded"
+else
+    log_message red "All external tests failed"
+fi
+
 # Stop the iperf server on Main (dry-run aware)
 log_message blue "Stopping iperf server on Main..."
 if [[ "$dry_run" == true ]]; then
@@ -309,5 +433,3 @@ for remote_ip in "${remotes[@]}"; do
         ssh_sudo "$remote_ip" "pkill iperf3" || handle_error "pkill_remote_iperf_server" "$?" "ssh_sudo '$remote_ip' 'pkill iperf3'"
     fi
 done
-
-log_message green "Network tests completed."
